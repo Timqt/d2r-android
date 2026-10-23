@@ -1,0 +1,33 @@
+# Shell scripts are pushed to an Android device and run by /system/bin/sh, which
+# rejects CRLF ("illegal file descriptor name"). Force LF in the repo AND in
+# every checkout, otherwise a Windows clone will produce broken scripts.
+*.sh    text eol=lf
+*.c     text eol=lf
+*.h     text eol=lf
+*.inc   text eol=lf
+*.py    text eol=lf
+*.md    text eol=lf
+*.json  text eol=lf
+*.prop  text eol=lf
+*.conf  text eol=lf
+*.txt   text eol=lf
+
+# A patch file is applied by `git apply`, which matches context lines byte for
+# byte. CRLF endings in the context make it fail, so keep patches LF too.
+*.patch text eol=lf
+
+# The i18n table is read by dm_i18n.py; keep it LF like the rest of the tree.
+*.tsv   text eol=lf
+
+# These two describe the checkout itself, so they follow the same rule.
+.gitignore    text eol=lf
+.gitattributes text eol=lf
+
+# binaries: never touch
+*.so    binary
+*.apk   binary
+*.jar   binary
+*.zip   binary
+*.png   binary
+*.jpg   binary
+*.keystore binary

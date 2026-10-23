@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "name": "Qualcomm Adreno 840",
+  "description": "Extracted from Meta Ray-Ban Display",
+  "author": "Hugo",
+  "packageVersion": "1",
+  "vendor": "Qualcomm",
+  "driverVersion": "Vulkan 1.4",
+  "minApi": 35,
+  "libraryName": "vulkan.adreno.so"
+}
+

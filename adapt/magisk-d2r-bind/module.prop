@@ -1,0 +1,6 @@
+id=d2r_bindmount
+name=D2R Android bind mount
+version=1.0
+versionCode=1
+author=local
+description=Double bind mount so getExternalFilesDir() lands on f2fs (sdcardfs cannot serve user.* xattr)

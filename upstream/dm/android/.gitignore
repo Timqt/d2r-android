@@ -1,0 +1,6 @@
+/build/
+/local.env
+__pycache__/
+# 可选的启动画面背景图覆盖：放同名的 launcher-background.* 进这里就用自己的图，仓库里的 dm/android/artwork/ 版本被覆盖。
+# Optional launcher backdrop override: drop a same-named launcher-background.* here to use your own image instead of the tracked one in dm/android/artwork/.
+/local/

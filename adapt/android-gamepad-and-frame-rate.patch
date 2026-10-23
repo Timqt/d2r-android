@@ -1,0 +1,1098 @@
+# 安卓端的改动：手柄 / 触屏接管权 + 帧率档 + 崩溃现场落盘
+#
+# 端口仓库的上游源码原本一行未改；下面是仅有的例外，都落在安卓前端与宿主共用的那份
+# 纯函数 / 状态机以及安卓宿主层里，游戏的代码一行没动。
+#
+# (1) 手柄 / 触屏接管权（对齐 iOS dm_gamepad.m 语义）：手柄有明确输入切手柄模式
+#     （屏幕虚拟手柄隐藏），碰屏幕切触屏模式（虚拟手柄回来），实体手柄的摇杆在触屏
+#     模式下不交给游戏。规则抽成 dm_input.h 的纯函数，安卓前端与宿主单测共用一份。
+#
+# (2) 帧率档：出图节拍原本被钉在 60 Hz（g_hz），现在前端可改（30 / 60 / 跟随屏幕最高
+#     刷新率），游戏内菜单多一行「帧率」，运行中即改即生效并写回配置。
+#     「跟随屏幕」必须**每次现算**屏幕刷新率：mtl_display_hz() 在没有窗口时返回 0，
+#     开机那会儿解析一次就会把 60 锁死（真机实测过这个坑）。
+#
+# (3) 上面 (1) 的一个坑（真机实测）：**native 的输入回调里不能同步做 Java 视图操作**。
+#     模式切换经 JNI 回调 Java 改 PopupWindow 可见性，会同步触发窗口事件，而窗口事件
+#     在 native 侧要拿锁、甚至释放 game_app —— 回到输入回调就是 use-after-free。
+#     症状：接上手柄后每次运行几十秒到几分钟就 SIGSEGV，没有 die 日志、没有 tombstone
+#     （崩溃处理器的诊断随 stderr 缓冲一起丢了）。修法：视图操作 post 出去；Java 自己
+#     要求切的那条路不再回播（回播会绕回 Java 的视图操作）。
+#
+# (4) 崩溃现场落盘（诊断加固，v13 起）：Android 上 native 的 fd 2 不接 logcat（直接进
+#     /dev/null），而 stderr 又是全缓冲的，进程被信号打死时缓冲内容一起丢 —— 于是崩溃
+#     现场（pc / 寄存器）什么都不剩。改法：崩的时候把 fd 2 指到 app 私有目录下的
+#     crash.txt，并 fflush(stderr)。定位崩溃时的权威线索仍是 Zygote 的
+#     "exited due to signal N"（ActivityManager 的 "app died" 与 libprocessgroup 的
+#     "killed process cgroup" 是后果不是原因）。
+#
+# 应用方式：在上游 clone（5d8e322）上打这个补丁（git apply），或直接取这些文件。
+#   dm/android/java/org/d2r/android/port/D2RActivity.java
+#   dm/android/java/org/d2r/android/port/LauncherActivity.java
+#   dm/android/native/frontend_activity.c
+#   dm/android/native/launch_settings.c
+#   dm/android/native/launch_settings.h
+#   dm/android/tests/launch_settings_test.c
+#   dm/gfx/nvn/hle_nvn.c
+#   dm/host/crash.c
+#   dm/host/dm.h
+#   dm/host/dm_i18n_tab.h
+#   dm/host/dm_input.h
+#   dm/host/hle_oe.c
+#   dm/host/tests/Makefile
+#   dm/host/tests/t_padmode.c
+#   dm/i18n/ui_text.tsv
+#
+diff --git a/dm/android/java/org/d2r/android/port/D2RActivity.java b/dm/android/java/org/d2r/android/port/D2RActivity.java
+index f8f0bc5..4b4d68d 100644
+--- a/dm/android/java/org/d2r/android/port/D2RActivity.java
++++ b/dm/android/java/org/d2r/android/port/D2RActivity.java
+@@ -51,6 +51,14 @@ public final class D2RActivity extends NativeActivity {
+     private volatile int batteryLevel = -1;
+     private volatile int batteryStatus = -1;
+     private boolean physicalController;
++    // 手柄模式 = 实体手柄接管（屏幕虚拟手柄隐藏）。与 iOS 前端同语义：谁有明确输入谁接管 ——
++    // 手柄按下任何键或把摇杆推出来 → 手柄模式；碰了游戏画面 → 触屏模式（虚拟手柄回来）。
++    // 原生那边是权威（它才看得到手柄事件），状态变化时回调 onPadMode 告诉这里。
++    // Controller mode: a physical controller has taken over, so the on-screen controls are hidden. Same semantics as
++    // the iOS front end: whoever has explicit input takes over -- a button press or a stick pushed out -> controller
++    // mode; the game screen touched -> touch mode (the on-screen controls come back). The native side is the authority
++    // (only it sees controller events) and calls onPadMode when the mode changes.
++    private volatile boolean padMode;
+     private boolean touchVisible;
+     // 同一进程里「游戏活动是否还活着」的标记，启动界面据此决定让位（见 LauncherActivity.stepAsideForRunningGame）。
+     // 一个进程只跑一个游戏，所以它也等于「这一局还在」。
+@@ -59,8 +67,16 @@ public final class D2RActivity extends NativeActivity {
+     static volatile boolean hostRunning;
+     private static native void onTextResult(long request, String text, boolean accepted);
+     private static native void onTouchPad(long buttons, int leftX, int leftY, int rightX, int rightY);
++    // 有没有实体手柄在场，以及要的模式（1 手柄 / 0 触屏）。原生那边据此清掉拔掉时按住的键。
++    // Whether a controller is present, and the wanted mode (1 controller, 0 touch). The native side uses it to clear
++    // the buttons that were held while the controller was unplugged.
++    private static native void setPadMode(int pad, boolean present);
+     private static native void setOverlayEnabled(boolean enabled);
+     private static native void setQualityPreset(int preset);
++    // 帧率目标：>0 固定帧率，<0 跟随屏幕最高刷新率。运行中可改，下一次出图生效。
++    // The frame rate target: >0 a fixed rate, <0 follow the screen's maximum refresh rate. It can change at run time
++    // and takes effect on the next present.
++    private static native void setPresentHz(int hz);
+     private static native void setMenuOpen(boolean open);
+     private static native void setSkipSaveOnExit(boolean skip);
+ 
+@@ -78,11 +94,17 @@ public final class D2RActivity extends NativeActivity {
+     // easy to hit by accident and would quit the whole run. So back opens this menu instead: frame rate display /
+     // on-screen controls / quality / exit game. Press back again (or tap outside) to close it.
+     private PopupWindow menuPopup;
+-    private TextView menuOverlayRow, menuControlsRow, menuQualityRow;
++    private TextView menuOverlayRow, menuControlsRow, menuQualityRow, menuFrameRateRow;
+     private boolean overlayEnabled = true;
+     private boolean controlsEnabled = true;
+     private int qualityPreset;                                  // 0 自动 / 1 高质量 / 2 平衡 / 3 性能 | 0 auto / 1 high / 2 balanced / 3 performance
+     private static final int[] QUALITY_LEVELS = {-1, 0, 1, 2};   // 与 native 约定：-1 自动、0 高、1 平衡、2 性能 | the native contract
++    // 帧率档：30 / 60 / 跟随屏幕（-1 = 跟随屏幕最高刷新率）。
++    // 缺省 60：宿主原本就把出图节拍钉在 60 Hz，120 Hz 屏上要自己选「跟随屏幕」才拿得到高帧率。
++    // Frame rate presets: 30 / 60 / follow the screen (-1 = the screen's maximum refresh rate).
++    // 60 by default: the host pinned the present rate at 60 Hz; on a 120 Hz screen "follow" is what unlocks the higher rate.
++    private static final int[] PRESENT_HZ_VALUES = {30, 60, -1};
++    private int presentHzIndex = 1;
+     private static final String[] QUALITY_KEYS = {"dmAndroidMenuQualityAuto", "dmAndroidMenuQualityHigh", "dmAndroidMenuQualityBalanced", "dmAndroidMenuQualityPerformance"};
+     // 与启动界面同一套配色（那边是 GOLD/PARCHMENT），菜单里照用，视觉上是一家人。
+     // The same palette as the launcher (GOLD/PARCHMENT there), so the menu looks like part of the same app.
+@@ -156,6 +178,11 @@ public final class D2RActivity extends NativeActivity {
+         menuQualityRow = menuRow();
+         menuQualityRow.setOnClickListener(v -> { qualityPreset = (qualityPreset + 1) % QUALITY_KEYS.length; setQualityPreset(QUALITY_LEVELS[qualityPreset]); updateMenuLabels(); });
+         column.addView(menuQualityRow);
++        // 帧率：出图节拍（60 帧是缺省；「跟随屏幕」在高刷屏上按屏幕的刷新率走）。
++        // Frame rate: the present rate (60 by default; "follow the screen" uses the screen's refresh rate).
++        menuFrameRateRow = menuRow();
++        menuFrameRateRow.setOnClickListener(v -> { presentHzIndex = (presentHzIndex + 1) % PRESENT_HZ_VALUES.length; applyPresentHz(); updateMenuLabels(); });
++        column.addView(menuFrameRateRow);
+         // 存档导入 / 导出：走系统的文件选择器，导出到玩家选的位置（下载目录等），导入也是玩家选文件。
+         // Save import/export goes through the system file picker: export writes to wherever the player picks
+         // (Downloads and so on), import reads a file the player picks.
+@@ -190,6 +217,31 @@ public final class D2RActivity extends NativeActivity {
+         menuOverlayRow.setText(text("dmAndroidMenuOverlay") + "：" + (overlayEnabled ? on : off));
+         menuControlsRow.setText(text("dmAndroidMenuControls") + "：" + (controlsEnabled ? on : off));
+         menuQualityRow.setText(text("dmAndroidMenuQuality") + "：" + text(QUALITY_KEYS[qualityPreset]));
++        if (menuFrameRateRow != null) menuFrameRateRow.setText(text("dmAndroidMenuFrameRate") + "：" + frameRateLabel());
++    }
++
++    // 帧率档的当前值与它的写法（配置里同一个键：0 = 跟随屏幕，其余是固定帧率）。
++    // The frame rate preset's current value and how it is written (the same key in the configuration: 0 = follow the
++    // screen, otherwise a fixed rate).
++    private String frameRateLabel() {
++        int hz = PRESENT_HZ_VALUES[presentHzIndex];
++        if (hz < 0) return text("dmAndroidMenuFpsFollow");
++        return hz + " " + text("dmAndroidMenuFpsUnit");
++    }
++
++    private String presentHzSetting() {
++        int hz = PRESENT_HZ_VALUES[presentHzIndex];
++        return hz < 0 ? "0" : String.valueOf(hz);
++    }
++
++    // 应用帧率档：立刻告诉原生（下一次出图生效），并写回配置，下次启动还是这一档。
++    // Apply the frame rate preset: tell the native side at once (effective on the next present) and write it back so
++    // the next launch starts with the same preset.
++    private void applyPresentHz() {
++        setPresentHz(PRESENT_HZ_VALUES[presentHzIndex]);
++        File file = configFile();
++        if (file != null) LaunchSettings.write(file, "present_hz", presentHzSetting());
++        Log.i("D2RAndroid", "[fps] target=" + presentHzSetting() + " Hz");
+     }
+ 
+     // 「帧率显示」写回配置：重启后还记得（native 启动时读 DM_DEBUG_OVERLAY）。
+@@ -382,6 +434,17 @@ public final class D2RActivity extends NativeActivity {
+         // (only an explicit 1 means on).
+         String overlaySetting = LaunchSettings.read(configFile(), "debug_overlay");
+         overlayEnabled = overlaySetting != null && overlaySetting.equals("1");
++        // 帧率档：配置里写了就按它来（缺省 60，与宿主原本一样）。原生那边在开机时读同一个键，
++        // 这里读一份只是为了菜单上的标签显示得对。
++        // The frame rate preset: use the configured one when present (60 by default, as the host had it). The native
++        // side reads the same key at startup; this copy is only so the menu label shows the right value.
++        String hzSetting = LaunchSettings.read(configFile(), "present_hz");
++        if (hzSetting != null) {
++            for (int i = 0; i < PRESENT_HZ_VALUES.length; i++) {
++                int hz = PRESENT_HZ_VALUES[i];
++                if (hzSetting.equals(hz < 0 ? "0" : String.valueOf(hz))) { presentHzIndex = i; break; }
++            }
++        }
+         getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING);
+         debugView = new TextView(this);
+         debugView.setTypeface(Typeface.MONOSPACE);
+@@ -417,22 +480,40 @@ public final class D2RActivity extends NativeActivity {
+         // The listener only fires on change, so scan once to catch a controller already connected at launch.
+         InputManager inputManager = (InputManager) getSystemService(Context.INPUT_SERVICE);
+         if (inputManager != null) inputManager.registerInputDeviceListener(inputDeviceListener, null);
+-        refreshPhysicalController();
++        refreshPhysicalController(true);
+         touchControls = new TouchControls(this, (buttons, x, y) -> onTouchPad(buttons, x, y, 0, 0));
+     }
+ 
+     private void updateTouchVisibility() {
+         if (touchControls == null) return;
+-        boolean value = controlsEnabled && activityResumed && hasWindowFocus() && textDialog == null && !physicalController;
++        boolean value = controlsEnabled && activityResumed && hasWindowFocus() && textDialog == null && !padMode;
+         // 诊断构建：每次求值都打印。只打「状态翻转」时，恒为 false 的情况一行日志都不会留下，正是最难查的那种。
+         // Diagnostic build: log every evaluation. Logging only transitions leaves the always-false case with no line at
+         // all, which is exactly the case that is hardest to diagnose.
+         Log.i("D2RAndroid", "[touch] evaluate=" + value + " (enabled=" + controlsEnabled + " resumed=" + activityResumed +
+-            " focus=" + hasWindowFocus() + " dialog=" + (textDialog != null) + " gamepad=" + physicalController + ")");
++            " focus=" + hasWindowFocus() + " dialog=" + (textDialog != null) + " padMode=" + padMode +
++            " gamepad=" + physicalController + ")");
+         touchVisible = value;
+         touchControls.setVisible(value);
+     }
+ 
++    // 原生 → Java：模式已经切了，屏幕虚拟手柄跟着显隐。
++    // **视图操作必须 post 出去**：这个回调是从 native 的输入回调里经 JNI 调进来的（那边还握着 native 的
++    // game_app）。在这里同步改视图会同步触发窗口事件，而窗口事件在 native 侧要拿锁、甚至释放 game_app ——
++    // 回到输入回调就是 use-after-free。真机实测：接上手柄后每次运行几十秒到几分钟就 SIGSEGV，
++    // 没有 die 日志、没有 tombstone（崩溃处理器打印的现场随 stderr 缓冲一起丢了）。
++    // Native -> Java: the mode has switched, the on-screen controls follow.
++    // **The view work must be posted**: this callback arrives through JNI from the native input callback (which still
++    // holds the native game_app). Changing views synchronously here triggers window events synchronously, and those
++    // take the lock and may even free the game_app in native code -- returning into the input callback would then use
++    // it after free. Measured on a real device: with a controller attached, every run died with SIGSEGV after tens of
++    // seconds to a few minutes, with no die log and no tombstone (the crash handler's diagnostics were lost with the
++    // stderr buffer).
++    private void onPadMode(boolean pad) {
++        padMode = pad;
++        getWindow().getDecorView().post(() -> updateTouchVisibility());
++    }
++
+     // 手柄是否接入。只认真正能推的摇杆轴，避免把触屏、遥控器、系统注入的虚拟键盘也算成手柄。
+     // Count only devices that actually expose stick axes, so touchscreens, remotes and virtual keyboards do not
+     // count as a controller.
+@@ -477,19 +558,38 @@ public final class D2RActivity extends NativeActivity {
+     // Looper and consumes pad events, so window dispatch never sees them, while add/remove callbacks do not care
+     // who consumes the events.
+     private final InputManager.InputDeviceListener inputDeviceListener = new InputManager.InputDeviceListener() {
+-        @Override public void onInputDeviceAdded(int id) { refreshPhysicalController(); }
+-        @Override public void onInputDeviceRemoved(int id) { refreshPhysicalController(); }
+-        @Override public void onInputDeviceChanged(int id) { refreshPhysicalController(); }
++        @Override public void onInputDeviceAdded(int id) { refreshPhysicalController(true); }
++        @Override public void onInputDeviceRemoved(int id) { refreshPhysicalController(false); }
++        @Override public void onInputDeviceChanged(int id) { refreshPhysicalController(false); }
+     };
+ 
+-    private void refreshPhysicalController() {
++    // appeared = 刚接上一个设备。接上手柄 → 手柄模式（屏幕虚拟手柄隐藏，这是用户要求的）；
++    // 手柄没了 → 触屏模式（虚拟手柄回来）。
++    // 只是设备状态变了（onInputDeviceChanged）不夺走接管权：玩家刚碰过屏幕时不该被拉回手柄模式。
++    // appeared = a device was just connected. A controller appears -> controller mode (the on-screen controls hide, as
++    // asked); it is gone -> touch mode (the on-screen controls come back).
++    // A mere device change does not take the takeover away: a player who just touched the screen must not be pulled
++    // back into controller mode.
++    private void refreshPhysicalController(boolean appeared) {
+         physicalController = anyGamepad();
++        // 自己先把状态记上：原生那边不再把「Java 自己要求切」这一路回播（回播会绕回 Java 的视图操作，
++        // 而这条路是 Java 触发的，来回一趟没有必要）。原生那边只在它自己改模式时（手柄有输入 / 碰了屏幕）
++        // 才通知 Java。
++        // Record the state here first: the native side no longer echoes back the "Java asked for it" path (the echo
++        // would bounce into Java's view work for no reason). The native side only notifies Java when it changes the
++        // mode itself (controller input, or the screen was touched).
++        if (appeared && physicalController) { padMode = true; setPadMode(1, true); }
++        else if (!physicalController) { padMode = false; setPadMode(0, false); }
+         updateTouchVisibility();
+     }
+ 
+     @Override protected void onResume() {
+         super.onResume();
+         activityResumed = true;
++        // 把当前模式再告诉原生一次：进程重建后原生那边是新状态，这里是旧的，对齐一下。
++        // Tell the native side the current mode once more: after a process restart the native state is fresh while this
++        // one is stale, so bring them back in line.
++        setPadMode(padMode ? 1 : 0, physicalController);
+         updateTouchVisibility();
+     }
+ 
+diff --git a/dm/android/java/org/d2r/android/port/LauncherActivity.java b/dm/android/java/org/d2r/android/port/LauncherActivity.java
+index c927227..d5b93c1 100644
+--- a/dm/android/java/org/d2r/android/port/LauncherActivity.java
++++ b/dm/android/java/org/d2r/android/port/LauncherActivity.java
+@@ -67,16 +67,20 @@ public final class LauncherActivity extends Activity {
+     private TextView profileItem, resolutionItem, driverItem, importItem, statusView, startItem;
+     private boolean handheld;
+     private int resolutionIndex;
++    private String customResolution = "";   // 预设之外的手写分辨率（-1 档时用）| a hand-written resolution outside the presets
+     private int driverIndex;
+     private String packageSummary = "";
+     private boolean importing;
+     private volatile boolean cancelImport;
+     // 出图分辨率只提供几档预设：它是"主机档"尺寸，掌机档由 native 按 0.8 同比例缩放（与 Mac/iOS 同一语义）。
+     // 空字符串表示跟随档位（不写这个键，用原版 16:9 常数）。
++    // 1280x720 与 1600x900 是给 GPU 吃紧的机器留的：分辨率降一档，帧率就上去一截（实测 1080p→720p 约 10→16 帧）。
+     // The output resolution offers a few presets only: it is the docked-profile size and the handheld profile is
+     // scaled by 0.8 inside native code, the same semantics as Mac and iOS. An empty string means "follow the
+     // profile", which writes no key and keeps the original 16:9 constants.
+-    private static final String[] RESOLUTION_PRESETS = {"", "1920x1080", "2560x1440"};
++    // 1280x720 and 1600x900 are there for GPU-bound devices: one step down in resolution is a real step up in frame
++    // rate (measured 1080p -> 720p: about 10 -> 16 fps).
++    private static final String[] RESOLUTION_PRESETS = {"", "1280x720", "1600x900", "1920x1080", "2560x1440"};
+     // 图形驱动两档：系统自带的 Adreno 驱动，和随 APK 一起发的 Turnip（选它由 native 的 gpu-driver.conf 生效）。
+     // Measured difference: the Adreno driver shows blocky lighting around the player, Turnip does not — see the
+     // driver notes under docs/.
+@@ -180,6 +184,10 @@ public final class LauncherActivity extends Activity {
+     }
+ 
+     private String resolutionLabel() {
++        if (resolutionIndex < 0) {   // 预设里没有的手写分辨率：原样留着，不被启动界面冲掉
++            String[] parts = customResolution.split("x");
++            return text("dmAndroidLaunchResolution") + "：" + (parts.length == 2 ? parts[0] + "×" + parts[1] : customResolution);
++        }
+         String preset = RESOLUTION_PRESETS[resolutionIndex];
+         if (preset.isEmpty()) return text("dmAndroidLaunchResolution") + "：" + text("dmAndroidLaunchFollowProfile");
+         String[] parts = preset.split("x");
+@@ -305,7 +313,17 @@ public final class LauncherActivity extends Activity {
+         if (overlaySwitch != null) overlaySwitch.setChecked("1".equals(LaunchSettings.read(configFile(), "debug_overlay")));
+         String preset = LaunchSettings.read(configFile(), "resolution");
+         resolutionIndex = 0;
+-        if (preset != null) for (int i = 0; i < RESOLUTION_PRESETS.length; i++) if (RESOLUTION_PRESETS[i].equals(preset)) resolutionIndex = i;
++        customResolution = "";
++        if (preset != null) {
++            int found = -1;
++            for (int i = 0; i < RESOLUTION_PRESETS.length; i++) if (RESOLUTION_PRESETS[i].equals(preset)) found = i;
++            // 预设里没有的值（玩家自己写进配置的）原样留着：启动界面以前会把这种值悄悄抹掉，
++            // 手写的 720p 每次启动都失效就是这个原因。
++            // A value that is not one of the presets (the player wrote it into the configuration) is kept as it is:
++            // the launcher used to silently drop it, which is why a hand-written 720p stopped working on every launch.
++            if (found >= 0) resolutionIndex = found;
++            else if (!preset.isEmpty()) { resolutionIndex = -1; customResolution = preset; }
++        }
+         // 驱动选择记在启动界面自己的状态文件里：launch-settings.conf 由 native 按严格白名单解析，塞不进新键。
+         // APK 没带内置驱动时强制回到系统驱动，免得状态文件里的旧值让界面显示一个不存在的选项。
+         // The driver choice lives in the launcher's own state file: launch-settings.conf is parsed by native
+@@ -611,7 +629,8 @@ public final class LauncherActivity extends Activity {
+         content.append("operation_mode=").append(handheld ? "handheld" : "console").append('\n');
+         // 跟随档位时不写这个键：native 语义里"省略"就是不改动，保持原版 16:9 常数。
+         // "Follow profile" writes no key: omitting it means "leave it alone" to native, keeping the original 16:9 constants.
+-        if (!RESOLUTION_PRESETS[resolutionIndex].isEmpty()) content.append("resolution=").append(RESOLUTION_PRESETS[resolutionIndex]).append('\n');
++        if (resolutionIndex < 0) content.append("resolution=").append(customResolution).append('\n');
++        else if (!RESOLUTION_PRESETS[resolutionIndex].isEmpty()) content.append("resolution=").append(RESOLUTION_PRESETS[resolutionIndex]).append('\n');
+         content.append(LaunchSettings.foreign(configFile(), OWNED_KEYS));
+         write(configFile(), content.toString());
+         setStatus("", PARCHMENT);
+diff --git a/dm/android/native/frontend_activity.c b/dm/android/native/frontend_activity.c
+index 0104f44..5bcc155 100644
+--- a/dm/android/native/frontend_activity.c
++++ b/dm/android/native/frontend_activity.c
+@@ -32,10 +32,28 @@ typedef struct {
+     int stop; _Atomic int started; _Atomic int activity_resumed;
+     uint64_t pad_buttons,hat_buttons,trigger_buttons,move_keys;int tap_a;int32_t lx,ly,rx,ry;
+     uint64_t touch_buttons;int32_t touch_lx,touch_ly,touch_rx,touch_ry;
++    uint64_t pad_prev_b;dm_pad_mode_state pad_state;
+     pthread_t debug_thread;int debug_started;_Atomic int debug_stop;
+     float requested_frame_rate;int frame_rate_attempted;
++    int swapchain_width,swapchain_height;   // 当前交换链的窗口尺寸：旋转（两个横向）时不变 | window size of the current swapchain: unchanged by a rotation between the two landscapes
+ } game_app;
+ static game_app *application;
++// 手柄 / 触屏两套输入的接管权（与 iOS 前端 dm_gamepad.m 同语义；规则本身在 dm_input.h 的纯函数里，两端共用一份）。
++//   · 手柄按下任何键 / 把摇杆推过 25% → 手柄模式：屏幕虚拟手柄隐藏，实体手柄接管；
++//   · 碰了游戏画面 → 触屏模式：虚拟手柄显示，实体手柄的摇杆不交给游戏；
++//   · 碰过屏幕后，摇杆要先回中再推出来才重新接管（漂移大的手柄不会来回切）；按键随时接管。
++// 安卓这端的"触屏界面"是 Java 画的屏幕虚拟手柄，不是 ROM 里的触屏布局（安卓没装触屏布局覆盖层，
++// ROM 一直是原版手柄界面），所以这里切的是：屏幕虚拟手柄显隐 + 实体手柄的摇杆交不交给游戏。
++// The controller / touch takeover (same semantics as the iOS front end; the rules live in the pure functions of
++// dm_input.h so both ends share one copy).
++//   - Controller: any button press or a stick pushed past 25% -> controller mode: the on-screen controls hide;
++//   - the game screen is touched -> touch mode: the on-screen controls show and the controller sticks are not handed to the game;
++//   - after a screen touch, a stick has to recentre before it takes over again; buttons always take over.
++// On Android the "touch UI" is the on-screen controls drawn by Java, not a touch layout in the ROM (Android ships no
++// touch layout overlay, so the ROM stays on the original controller layout), so what switches here is the on-screen
++// controls' visibility and whether the controller sticks reach the game.
++static _Atomic int g_pad_mode;   // 1 = 手柄模式，0 = 触屏模式 | 1 = controller mode, 0 = touch mode
++void dm_padmode_request(int pad);   // 宿主 dm_padmode.c：布局换成原版手柄版 / 触屏版 | Host dm_padmode.c: switch the layouts
+ static _Atomic int display_hz;
+ // 运行时可切的调试浮层（游戏内菜单的「帧率显示」）：UI 线程写，调试线程每拍读。启动初值见 debug_overlay 的读取处。
+ // Runtime-togglable debug overlay (the in-game menu's "frame rate display"): the UI thread writes it, the debug
+@@ -269,7 +287,11 @@ static void *boot(void *argument) {
+     // Apply fully validated application settings before the guest first caches its operation mode and input log.
+     dm_android_launch_settings launch;char launch_error[512];
+     if(!dm_android_launch_settings_apply(path,&launch,launch_error,sizeof launch_error))die("[android] launch settings: %s",launch_error);
+-    LOG("[android] launch configuration present=%d operation_mode=%d input_receipts=%d 分辨率=%dx%d",launch.present,launch.operation_mode,launch.input_receipts,launch.resolution_width,launch.resolution_height);
++    LOG("[android] launch configuration present=%d operation_mode=%d input_receipts=%d 分辨率=%dx%d present_hz=%d",launch.present,launch.operation_mode,launch.input_receipts,launch.resolution_width,launch.resolution_height,launch.present_hz);
++    // 帧率目标：配置里写了才改（未写就是原来的 60 Hz）。0 = 跟随屏幕最高刷新率。
++    // The frame rate target: only applied when the configuration sets it (unset keeps the original 60 Hz). 0 = follow the
++    // screen's maximum refresh rate.
++    if(launch.present_hz>=0){void dm_present_hz_set(int);dm_present_hz_set(launch.present_hz==0?-1:launch.present_hz);}
+     // 设置生效后立刻记一次环境，确认 DM_GAME_RES 真的传下去了（否则只会在游戏那边看到"未设"）。
+     // Immediately record the environment after the settings apply, to confirm DM_GAME_RES really got through;
+     // otherwise the only symptom is "unset" on the game side.
+@@ -347,19 +369,81 @@ int dm_thermal_now(void) {
+     void *(*acquire)(void)=dlsym(library,"AThermal_acquireManager");void (*release)(void*)=dlsym(library,"AThermal_releaseManager");int (*status)(void*)=dlsym(library,"AThermal_getCurrentThermalStatus");int result=-1;
+     if(acquire&&release&&status){void *manager=acquire();if(manager){int v=status(manager);result=v<0?-1:v==0?0:v<=2?1:v==3?2:3;release(manager);}}dlclose(library);return result;
+ }
++// 模式变化告诉 Java：屏幕虚拟手柄是应用内 PopupWindow（原生 Vulkan 直接拥有 Activity 窗口），
++// 显隐只能由 Java 侧改。只在主线程调用（输入队列就挂在主 Looper 上）。
++// **Java 那边绝不能在这里同步改视图**：改视图会同步触发窗口事件，而窗口事件在 native 侧要拿锁、
++// 甚至释放 game_app（destroyed）—— 回到这个输入回调就是 use-after-free。真机实测：接上手柄后每次运行
++// 几十秒到几分钟就 SIGSEGV，没有 die 日志、没有 tombstone（崩溃处理器打印的现场随 stderr 缓冲一起丢了）。
++// Java 侧因此把视图操作 post 出去（见 D2RActivity.onPadMode）。
++// Tell Java about a mode change: the on-screen controls are app-side PopupWindows (the native Vulkan surface owns the
++// Activity window), so only Java can change their visibility. Called on the main thread (the input queue hangs on it).
++// **Java must not change views synchronously here**: that triggers window events synchronously, and those take the
++// lock and may even free the game_app in native code (destroyed) -- returning into this input callback would then
++// use it after free. Measured on a real device: with a controller attached, every run died with SIGSEGV after tens
++// of seconds to a few minutes, with no die log and no tombstone (the crash handler's diagnostics were lost with the
++// stderr buffer). Java therefore posts the view work (see D2RActivity.onPadMode).
++static void java_pad_mode(game_app *s,int pad) {
++    ANativeActivity *a=s->activity;if(!a||!a->vm||!a->clazz)return;
++    JNIEnv *env=NULL;if((*a->vm)->GetEnv(a->vm,(void**)&env,JNI_VERSION_1_6)!=JNI_OK)return;
++    jclass klass=(*env)->GetObjectClass(env,a->clazz);if(!klass)return;
++    jmethodID method=(*env)->GetMethodID(env,klass,"onPadMode","(Z)V");
++    if(method&&!(*env)->ExceptionCheck(env))(*env)->CallVoidMethod(env,a->clazz,method,pad?JNI_TRUE:JNI_FALSE);
++    if((*env)->ExceptionCheck(env))(*env)->ExceptionClear(env);
++    (*env)->DeleteLocalRef(env,klass);
++}
++// 切模式：改状态、通知宿主（那一层在安卓今天没有可见变化——安卓没装触屏布局覆盖层，将来装了才是真切换）、
++// 必要时告诉 Java（屏幕虚拟手柄的显隐在 Java 那边）。
++// notify=0 用于「Java 自己要求切」那条路：Java 本来就知道自己切到了哪，不必再被回调一次（那个回环会在
++// native 的输入回调里同步做视图操作，见 java_pad_mode 的注释）。
++// Switch the mode: update the state, tell the host (no visible effect on Android today -- no touch layout
++// overlay is installed; it becomes a real layout switch once one is) and tell Java when needed (the on-screen
++// controls live there).
++// notify=0 is for the "Java asked for it" path: Java already knows which mode it asked for and must not be called
++// back (that loop would do view work synchronously inside the native input callback, see the note in java_pad_mode).
++static void set_pad_mode(game_app *s,int pad,int notify) {
++    if(atomic_load(&g_pad_mode)==pad)return;
++    atomic_store(&g_pad_mode,pad);
++    dm_padmode_request(pad);
++    LOG("[android-pad] 输入模式 → %s",pad?"手柄（屏幕虚拟手柄隐藏）":"触屏（屏幕虚拟手柄显示）");
++    if(notify)java_pad_mode(s,pad);
++}
++// 碰了游戏画面：回触屏模式；摇杆要回中再推出来才重新接管（iOS 同此）。
++// The game screen was touched: back to touch mode; a stick has to recentre before it takes over again (same as iOS).
++static void pad_touched(game_app *s) {
++    if(!atomic_load(&g_pad_mode))return;
++    s->pad_state.need_center=1;
++    set_pad_mode(s,0,1);
++}
++// 手柄活动：按下了新的键，或摇杆推出来了 → 手柄模式。
++// Controller activity: a new button press, or a stick pushed out -> controller mode.
++static void pad_activity(game_app *s) {
++    uint64_t buttons=s->pad_buttons|s->hat_buttons|s->trigger_buttons;
++    dm_pad_mode_update(&s->pad_state,0,s->lx,s->ly);
++    dm_pad_mode_update(&s->pad_state,1,s->rx,s->ry);
++    dm_pad_mode_centered(&s->pad_state);
++    if(dm_pad_mode_takeover(&s->pad_state,buttons,s->pad_prev_b))set_pad_mode(s,1,1);
++    s->pad_prev_b=buttons;
++}
+ static void pad_publish(game_app *s) {
+     int32_t x=s->lx,y=s->ly;
+     if(s->move_keys){x=((!!(s->move_keys&DM_BTN_RIGHT))-(!!(s->move_keys&DM_BTN_LEFT)))*DM_STICK_MAX;y=((!!(s->move_keys&DM_BTN_UP))-(!!(s->move_keys&DM_BTN_DOWN)))*DM_STICK_MAX;}
++    // 触屏模式不把实体手柄的摇杆交给游戏（iOS 同此）：放在一边漂移的手柄不该盖掉触屏摇杆；
++    // 手柄模式下没推出来的摇杆给 0（迟滞判定在 pad_activity 里）。键盘（WASD）不归这套管，它照旧优先。
++    // The controller sticks are not handed to the game in touch mode (same as iOS): a controller lying aside with drift
++    // must not override the touch stick. In controller mode a stick that is not pushed out gives 0 (the hysteresis is
++    // decided in pad_activity). The keyboard (WASD) is not part of this and keeps its precedence.
++    else if(!atomic_load(&g_pad_mode)||!s->pad_state.stick_on[0]){x=0;y=0;}
+     // 分开合并实体与屏幕手柄；抬起一只手不会清掉另一输入来源仍按住的键。
+     // 十字键来自 HAT 轴时用它自己的位掩码，否则一次 HAT 归零会把同时按住的 DPAD 键码也清掉。
+     // Merge physical and on-screen pads separately; releasing one source never clears a key held by another.
+     // D-pad bits that arrive as HAT axes keep their own mask, otherwise one HAT zero would also clear a
+     // simultaneously held DPAD keycode.
+     if(!x&&!y){x=s->touch_lx;y=s->touch_ly;}
+-    int32_t rx=s->rx,ry=s->ry;if(!rx&&!ry){rx=s->touch_rx;ry=s->touch_ry;}
++    int32_t rx=s->rx,ry=s->ry;if(!atomic_load(&g_pad_mode)||!s->pad_state.stick_on[1]){rx=0;ry=0;}
++    if(!rx&&!ry){rx=s->touch_rx;ry=s->touch_ry;}
+     dm_pad_set(s->pad_buttons|s->hat_buttons|s->trigger_buttons|s->touch_buttons|(s->tap_a?DM_BTN_A:0),x,y,rx,ry);
+ }
+-static void pad_clear(game_app *s) {s->pad_buttons=s->hat_buttons=s->trigger_buttons=s->move_keys=s->touch_buttons=0;s->tap_a=0;s->lx=s->ly=s->rx=s->ry=s->touch_lx=s->touch_ly=s->touch_rx=s->touch_ry=0;pad_publish(s);}
++static void pad_clear(game_app *s) {s->pad_buttons=s->hat_buttons=s->trigger_buttons=s->move_keys=s->touch_buttons=0;s->tap_a=0;s->lx=s->ly=s->rx=s->ry=s->touch_lx=s->touch_ly=s->touch_rx=s->touch_ry=0;s->pad_prev_b=0;pad_publish(s);}
+ static int32_t touch_axis(jint value) {return value>DM_STICK_MAX?DM_STICK_MAX:value< -DM_STICK_MAX?-DM_STICK_MAX:value;}
+ // 游戏内菜单的两项运行时开关。注意命名方向：Java 侧的 setDebugOverlay 是 native → Java（通知显隐），
+ // 这两个是 Java → native（菜单点了要改状态），所以名字不同。
+@@ -371,6 +455,12 @@ __attribute__((visibility("default"))) void Java_org_d2r_android_port_D2RActivit
+ __attribute__((visibility("default"))) void Java_org_d2r_android_port_D2RActivity_setQualityPreset(JNIEnv *env,jclass klass,jint preset) {
+     (void)env;(void)klass;dm_3d_scale_set_preset((int)preset);
+ }
++// 帧率目标：>0 固定帧率，<0 跟随屏幕最高刷新率。运行中可改，下一次出图生效。
++// The frame rate target: >0 a fixed rate, <0 follow the screen's maximum refresh rate. It can change at run time and
++// takes effect on the next present.
++__attribute__((visibility("default"))) void Java_org_d2r_android_port_D2RActivity_setPresentHz(JNIEnv *env,jclass klass,jint hz) {
++    (void)env;(void)klass;void dm_present_hz_set(int);dm_present_hz_set((int)hz);
++}
+ __attribute__((visibility("default"))) void Java_org_d2r_android_port_D2RActivity_setMenuOpen(JNIEnv *env,jclass klass,jboolean open) {
+     (void)env;(void)klass;atomic_store(&menu_open,open?1:0);
+ }
+@@ -383,6 +473,27 @@ __attribute__((visibility("default"))) void Java_org_d2r_android_port_D2RActivit
+     // Java window touches and AInputQueue run on the Activity's main Looper; both use the HLE press-edge latch.
+     s->touch_buttons=(uint64_t)buttons&0xffff;s->touch_lx=touch_axis(lx);s->touch_ly=touch_axis(ly);s->touch_rx=touch_axis(rx);s->touch_ry=touch_axis(ry);pad_publish(s);
+ }
++// Java → native：有没有实体手柄在场，以及要的模式。
++// 手柄不在场时把实体手柄的按键与摇杆清掉（拔掉时按住的键不该卡住），回触屏模式；
++// 在场时只切模式，不动状态（玩家的手柄还连着，只是暂时没动）。
++// Java -> native: whether a controller is present, and the wanted mode.
++// With no controller present the controller's buttons and sticks are cleared (a button held while it was unplugged
++// must not stick) and the mode goes back to touch; with one present only the mode changes, the state stays.
++__attribute__((visibility("default"))) void Java_org_d2r_android_port_D2RActivity_setPadMode(JNIEnv *env,jclass klass,jint pad,jboolean present) {
++    (void)env;(void)klass;game_app *s=application;if(!s)return;
++    int mode=pad?1:0;
++    if(present){s->pad_state.need_center=0;}
++    else {
++        s->pad_buttons=s->hat_buttons=s->trigger_buttons=0;s->lx=s->ly=s->rx=s->ry=0;s->pad_prev_b=0;
++        s->pad_state.stick_on[0]=s->pad_state.stick_on[1]=0;s->pad_state.need_center=0;mode=0;
++    }
++    // 这条路是 Java 自己要求切的：Java 那边已经知道状态，不再回播（回播会绕回 Java 的视图操作，
++    // 而这里是 Java 触发的，来回一趟没有必要）。
++    // This path is Java asking for the switch: Java already knows the state, so it is not told back (telling it
++    // would bounce into Java's view work for no reason).
++    set_pad_mode(s,mode,0);
++    if(!present)pad_publish(s);
++}
+ static int32_t stick_value(float value) {if(value>1)value=1;if(value<-1)value=-1;return value>-.15f&&value<.15f?0:(int32_t)(value*DM_STICK_MAX);}
+ static uint64_t pad_key(int key) {
+     switch(key){case AKEYCODE_DPAD_UP:return DM_BTN_UP;case AKEYCODE_DPAD_DOWN:return DM_BTN_DOWN;case AKEYCODE_DPAD_LEFT:return DM_BTN_LEFT;case AKEYCODE_DPAD_RIGHT:return DM_BTN_RIGHT;
+@@ -399,6 +510,9 @@ static int input_ready(int fd,int events,void *data) {
+         // Pad events arrive with either a JOYSTICK or a GAMEPAD source. Accepting only the former sends a
+         // GAMEPAD-source D-pad into the touch branch below, where it is read as a finger position.
+         int source=AInputEvent_getSource(event),is_motion=AInputEvent_getType(event)==AINPUT_EVENT_TYPE_MOTION;
++        // 手柄来源与键盘来源分开：键盘的 Enter/Space 也映射成 A，但那是键盘动作，不该把手柄模式拉起来
++        // （否则用键盘的玩家会突然失去屏幕虚拟手柄）。手柄的键事件源带 JOYSTICK/GAMEPAD。
++        int pad_source=(source&(AINPUT_SOURCE_JOYSTICK|AINPUT_SOURCE_GAMEPAD))!=0;
+         // 游戏内菜单打开时挡住手柄与按键：菜单是独立窗口，手柄事件照样从 AInputQueue 进来，不挡的话角色会在菜单后面
+         // 继续动。两处**放行**：① 返回键 —— 它要走到菜单窗口去把菜单收起（菜单是 focusable 弹窗，自己会吃掉返回键）；
+         // ② 触摸 —— 菜单自己的触摸走它自己的窗口，屏幕手柄也要能点。
+@@ -436,17 +550,36 @@ static int input_ready(int fd,int events,void *data) {
+             // lives in dm_input.h and is the single place to tune.
+             if(trigger!=s->trigger_buttons)LOG("[android-pad] trigger LT=%.2f RT=%.2f → buttons=%#llx (阈值 %.2f)",lt,rt,(unsigned long long)trigger,0.5);
+             s->trigger_buttons=trigger;
++            // 手柄活动 → 手柄模式（屏幕虚拟手柄隐藏）。
++            // Controller activity -> controller mode (the on-screen controls hide).
++            pad_activity(s);
+             pad_publish(s);handled=1;
+         }else if(is_motion){int raw_action=AMotionEvent_getAction(event),action=raw_action&AMOTION_EVENT_ACTION_MASK;unsigned lifted=(raw_action&AMOTION_EVENT_ACTION_POINTER_INDEX_MASK)>>AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT;dm_touch touches[16];int count=0;
+             pthread_mutex_lock(&s->lock);ANativeWindow *window=s->window;int w=window?ANativeWindow_getWidth(window):1,h=window?ANativeWindow_getHeight(window):1;pthread_mutex_unlock(&s->lock);
+             float gw=w,gh=w*9.f/16.f;if(gh>h){gh=h;gw=h*16.f/9.f;}float left=(w-gw)/2,top=(h-gh)/2;
+             if(action!=AMOTION_EVENT_ACTION_UP&&action!=AMOTION_EVENT_ACTION_CANCEL)for(unsigned i=0;i<AMotionEvent_getPointerCount(event)&&count<16;i++){if(action==AMOTION_EVENT_ACTION_POINTER_UP&&i==lifted)continue;float x=(AMotionEvent_getX(event,i)-left)/gw,y=(AMotionEvent_getY(event,i)-top)/gh;if(x>=0&&x<1&&y>=0&&y<1)touches[count++]=(dm_touch){AMotionEvent_getPointerId(event,i)&15,x,y};}
+             dm_touch_set(touches,count);
++            // 碰了游戏画面 → 触屏模式（屏幕虚拟手柄回来）。屏幕虚拟手柄自己的触摸在 Java 那边消费，不走这里，
++            // 所以玩家用虚拟手柄时模式不变（本来就在触屏模式）。
++            // The game screen was touched -> touch mode (the on-screen controls come back). The on-screen controls' own
++            // touches are consumed by Java and never reach here, so using them keeps the mode as it is.
++            if(action==AMOTION_EVENT_ACTION_DOWN||action==AMOTION_EVENT_ACTION_POINTER_DOWN)pad_touched(s);
+             // 首画面阶段：点击可确认标题/提示；按下沿由 HLE 锁存，不丢短按。
+             // First-frame controls: taps confirm title/prompts; HLE latches press edges so short taps are retained.
+             if(action==AMOTION_EVENT_ACTION_DOWN)s->tap_a=1;else if(action==AMOTION_EVENT_ACTION_UP||action==AMOTION_EVENT_ACTION_CANCEL)s->tap_a=0;pad_publish(s);handled=1;
+         }else if(AInputEvent_getType(event)==AINPUT_EVENT_TYPE_KEY){int key=AKeyEvent_getKeyCode(event),down=AKeyEvent_getAction(event)==AKEY_EVENT_ACTION_DOWN;uint64_t button=pad_key(key),move=key==AKEYCODE_W?DM_BTN_UP:key==AKEYCODE_A?DM_BTN_LEFT:key==AKEYCODE_S?DM_BTN_DOWN:key==AKEYCODE_D?DM_BTN_RIGHT:0;
+             if(button){uint64_t before=s->pad_buttons;if(down)s->pad_buttons|=button;else s->pad_buttons&=~button;handled=1;
++                // 手柄来源的判定：**键码优先**。键盘根本没有 BUTTON_* 与 DPAD_* 这些键码，所以它们本身就说明
++                // 来自手柄——有些手柄（实测 PG-9083S）的按键事件源只带 KEYBOARD 位，只看源就认不出手柄，
++                // 结果"按手柄键切手柄模式"永远不触发。Enter/Space/Esc 键盘也有，那几个才靠事件源分辨。
++                // Whether the key came from a controller: **the keycode decides first**. No keyboard reports BUTTON_*
++                // or DPAD_* keycodes, so those identify a controller by themselves -- some pads (measured: PG-9083S)
++                // deliver their key events with a KEYBOARD-only source, and judging by the source alone then never
++                // recognises the pad, so "a pad press switches to controller mode" never fires. Enter/Space/Esc do
++                // exist on keyboards, and those are told apart by the event source.
++                int controller_keycode=(key>=AKEYCODE_DPAD_UP&&key<=AKEYCODE_DPAD_CENTER)||(key>=AKEYCODE_BUTTON_A&&key<=AKEYCODE_BUTTON_MODE);
++                if(controller_keycode||pad_source)pad_activity(s);
++                if(pad_source!=controller_keycode)LOG("[android-pad] keycode=%d source=%#x 键码判定=%d 源判定=%d",key,(unsigned)source,controller_keycode,pad_source);
+                 // 按键码这条路也要看得见（LB/RB/A/B 等走这里，部分手柄的方向键也走这里）：出问题时能直接对上
+                 // 哪一颗键换来哪一位，不必靠猜。只在位掩码真的变了才记，连按不放不会刷屏。
+                 // The keycode path has to be visible too (LB/RB/A/B and, on some pads, the D-pad come through here):
+@@ -485,7 +618,7 @@ static void settle_save(void) {
+     if(last!=c0&&asked)LOG("[android] 退出前等游戏存盘 %.0f ms，期间存档提交 %llu 次%s",(now_ns()-t0)/1e6,(unsigned long long)(last-c0),paused?"（原先停在暂停菜单/面板，已放开）":"");
+     else LOG("[android] 【红】未存盘退出：3 秒内没等到存档提交（%s%s）",asked?"已请游戏存盘":"不处于可请存盘的状态",paused?"，原先暂停着、已放开":"");
+ }
+-static void window_created(ANativeActivity *a,ANativeWindow *w) {game_app *s=a->instance;pthread_mutex_lock(&s->lock);ANativeWindow_acquire(w);s->window=w;s->frame_rate_attempted=0;pthread_cond_signal(&s->ready);pthread_mutex_unlock(&s->lock);
++static void window_created(ANativeActivity *a,ANativeWindow *w) {game_app *s=a->instance;pthread_mutex_lock(&s->lock);ANativeWindow_acquire(w);s->window=w;s->frame_rate_attempted=0;s->swapchain_width=ANativeWindow_getWidth(w);s->swapchain_height=ANativeWindow_getHeight(w);pthread_cond_signal(&s->ready);pthread_mutex_unlock(&s->lock);
+     // 游戏已在跑时这块窗口是"从后台回来"的新窗口：挂起期间重建表面与交换链（此刻游戏线程被挡在 NVN 入口外，不会争）。
+     // When the game is already running this is the new window from returning to the foreground: rebuild the surface
+     // and swapchain while graphics are suspended, when the game thread is parked outside NVN and cannot contend.
+@@ -522,7 +655,16 @@ static void window_created(ANativeActivity *a,ANativeWindow *w) {game_app *s=a->
+ // rotation does not pass through onPause/onResume and is instantaneous, so the guest clock is **not** frozen (that
+ // is for going to the background); the suspension is released per the current foreground state.
+ static void window_resized(ANativeActivity *a,ANativeWindow *w) {game_app *s=a->instance;
+-    pthread_mutex_lock(&s->lock);int same_window=s->window==w;pthread_mutex_unlock(&s->lock);
++    pthread_mutex_lock(&s->lock);int same_window=s->window==w;int width=ANativeWindow_getWidth(w),height=ANativeWindow_getHeight(w);pthread_mutex_unlock(&s->lock);
++    // 旋转（两个横向之间）窗口**宽高相同**，只是朝向变了：合成器处理朝向即可，这时重建交换链是多余的，
++    // 而真机上重建那条路会崩（实测：转屏后 7 秒 SIGSEGV，22:00:46 转屏 → 22:00:53 崩）。
++    // 尺寸真变了（分屏 / 折叠屏展开 / 自由窗口）才重建。
++    // A rotation between the two landscapes keeps the window **size** and only changes the orientation: the
++    // compositor handles that, so rebuilding the swapchain is unnecessary -- and on a real device that path crashes
++    // (measured: rotation at 22:00:46, SIGSEGV at 22:00:53). Rebuild only when the size really changed (split
++    // screen, an unfolding foldable, a free-form window).
++    if(same_window&&width==s->swapchain_width&&height==s->swapchain_height){LOG("[android] 窗口朝向变了但尺寸没变（%dx%d）：不重建交换链",width,height);return;}
++    if(same_window){s->swapchain_width=width;s->swapchain_height=height;}
+     // 同一个窗口才处理：新窗口有 onNativeWindowCreated 那条路；后端还没活时也没有交换链要重建，第一次出图会自己建。
+     // 重建这一拍会慢（表面/交换链重建、缓存变冷），照回前台那次一样先告诉动态分辨率控制器别把它当成 GPU 吃紧。
+     // Only the same window is handled here: a new one goes through onNativeWindowCreated, and while the backend is
+@@ -586,8 +728,10 @@ __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActi
+     jclass klass=(*a->env)->GetObjectClass(a->env,a->clazz);JNINativeMethod methods[]={
+         {"onTextResult","(JLjava/lang/String;Z)V",(void*)Java_org_d2r_android_port_D2RActivity_onTextResult},
+         {"onTouchPad","(JIIII)V",(void*)Java_org_d2r_android_port_D2RActivity_onTouchPad},
++        {"setPadMode","(IZ)V",(void*)Java_org_d2r_android_port_D2RActivity_setPadMode},
+         {"setOverlayEnabled","(Z)V",(void*)Java_org_d2r_android_port_D2RActivity_setOverlayEnabled},
+         {"setQualityPreset","(I)V",(void*)Java_org_d2r_android_port_D2RActivity_setQualityPreset},
++        {"setPresentHz","(I)V",(void*)Java_org_d2r_android_port_D2RActivity_setPresentHz},
+         {"setMenuOpen","(Z)V",(void*)Java_org_d2r_android_port_D2RActivity_setMenuOpen},
+         {"setSkipSaveOnExit","(Z)V",(void*)Java_org_d2r_android_port_D2RActivity_setSkipSaveOnExit}
+     };
+diff --git a/dm/android/native/launch_settings.c b/dm/android/native/launch_settings.c
+index ba842cc..69637e4 100644
+--- a/dm/android/native/launch_settings.c
++++ b/dm/android/native/launch_settings.c
+@@ -94,6 +94,7 @@ static int parse_settings(char *content, dm_android_launch_settings *settings,
+             else if (!strcmp(key, "input_receipts")) bit = 2;
+             else if (!strcmp(key, "debug_overlay")) bit = 4;
+             else if (!strcmp(key, "resolution")) bit = 8;
++            else if (!strcmp(key, "present_hz")) bit = 16;
+             else return fail(error, capacity, "unknown launch settings key on line %u: %s", line_number, key);
+             if (seen & bit) return fail(error, capacity, "duplicate launch settings key on line %u: %s", line_number, key);
+             if (bit == 1) {
+@@ -113,6 +114,15 @@ static int parse_settings(char *content, dm_android_launch_settings *settings,
+                 if (!strcmp(value, "0")) settings->debug_overlay = 0;
+                 else if (!strcmp(value, "1")) settings->debug_overlay = 1;
+                 else return fail(error, capacity, "launch settings line %u: debug_overlay must be 0 or 1", line_number);
++            } else if (bit == 16) {
++                // 0 = 跟随屏幕最高刷新率；否则是固定的出图帧率（24–240 Hz）。
++                // 0 = follow the screen's maximum refresh rate; otherwise a fixed present rate (24-240 Hz).
++                unsigned hz = 0; char tail = 0;
++                if (sscanf(value, "%u%c", &hz, &tail) != 1)
++                    return fail(error, capacity, "launch settings line %u: present_hz must be 0 or 24-240", line_number);
++                if (hz != 0 && (hz < 24 || hz > 240))
++                    return fail(error, capacity, "launch settings line %u: present_hz must be 0 or 24-240", line_number);
++                settings->present_hz = (int)hz;
+             } else {
+                 if (!strcmp(value, "0")) settings->input_receipts = 0;
+                 else if (!strcmp(value, "1")) settings->input_receipts = 1;
+@@ -169,7 +179,7 @@ int dm_android_launch_settings_apply(const char *temporary_directory,
+                                      char *error, size_t error_capacity) {
+     if (error && error_capacity) error[0] = 0;
+     char path[SETTINGS_PATH_BYTES], content[SETTINGS_BYTES + 1];
+-    dm_android_launch_settings settings = {0, -1, -1, -1, -1, -1};
++    dm_android_launch_settings settings = {0, -1, -1, -1, -1, -1, -1};
+     if (!make_path(temporary_directory, "launch-settings.conf", path, error, error_capacity)) return 0;
+     if (!read_settings(path, content, &settings.present, error, error_capacity)) return 0;
+     if (!settings.present) { if (result) *result = settings; return 1; }
+diff --git a/dm/android/native/launch_settings.h b/dm/android/native/launch_settings.h
+index 65c03ca..72a79db 100644
+--- a/dm/android/native/launch_settings.h
++++ b/dm/android/native/launch_settings.h
+@@ -13,6 +13,7 @@ typedef struct dm_android_launch_settings {
+     int input_receipts; /* -1 未指定，0 关闭，1 开启 | -1 unspecified, 0 disabled, 1 enabled */
+     int debug_overlay; /* -1 未指定，0 关闭，1 开启 | -1 unspecified, 0 hidden, 1 shown */
+     int resolution_width, resolution_height; /* -1 未指定；否则为出图分辨率（主机档，掌机档按 0.8 同比例）| -1 unspecified; otherwise the output resolution (docked; handheld scales by 0.8) */
++    int present_hz; /* -1 未指定；0 跟随屏幕最高刷新率；否则为固定的出图帧率（24–240 Hz）| -1 unspecified; 0 follow the screen's maximum refresh rate; otherwise a fixed present rate (24-240 Hz) */
+ } dm_android_launch_settings;
+ 
+ // 在 boot 设置 DM_TEMP 后、其他线程首次读取运行模式/输入日志前调用；不是运行中切换接口。
+diff --git a/dm/android/tests/launch_settings_test.c b/dm/android/tests/launch_settings_test.c
+index 169621d..1556427 100644
+--- a/dm/android/tests/launch_settings_test.c
++++ b/dm/android/tests/launch_settings_test.c
+@@ -64,11 +64,11 @@ static dm_android_launch_settings apply_ok(const char *directory) {
+ static void expect_bad(const char *text, const char *message) {
+     reset_environment();
+     write_config(text);
+-    dm_android_launch_settings result = {17, 18, 19, 20, 21, 22};
++    dm_android_launch_settings result = {17, 18, 19, 20, 21, 22, 23};
+     char error[512];
+     assert(!dm_android_launch_settings_apply(temporary, &result, error, sizeof error));
+     assert(strstr(error, message));
+-    assert(result.present == 17 && result.operation_mode == 18 && result.input_receipts == 19 && result.debug_overlay == 20 && result.resolution_width == 21 && result.resolution_height == 22);
++    assert(result.present == 17 && result.operation_mode == 18 && result.input_receipts == 19 && result.debug_overlay == 20 && result.resolution_width == 21 && result.resolution_height == 22 && result.present_hz == 23);
+     expect_env("DM_OPMODE", "old-operation-mode");
+     expect_env("DM_HID_RECEIPT_LOG", "old-receipt-path");
+     expect_env("DM_DEBUG_OVERLAY", "old-overlay-mode");
+@@ -79,12 +79,12 @@ static void expect_bad(const char *text, const char *message) {
+ static void missing_defaults(void) {
+     reset_environment();
+     dm_android_launch_settings result = apply_ok(temporary);
+-    assert(!result.present && result.operation_mode == -1 && result.input_receipts == -1 && result.debug_overlay == -1 && result.resolution_width == -1 && result.resolution_height == -1);
++    assert(!result.present && result.operation_mode == -1 && result.input_receipts == -1 && result.debug_overlay == -1 && result.resolution_width == -1 && result.resolution_height == -1 && result.present_hz == -1);
+     expect_env("DM_OPMODE", "old-operation-mode"); expect_env("DM_HID_RECEIPT_LOG", "old-receipt-path");
+     tests++;
+     assert(!unsetenv("DM_OPMODE") && !unsetenv("DM_HID_RECEIPT_LOG"));
+     result = apply_ok(temporary);
+-    assert(!result.present && result.operation_mode == -1 && result.input_receipts == -1 && result.debug_overlay == -1 && result.resolution_width == -1 && result.resolution_height == -1);
++    assert(!result.present && result.operation_mode == -1 && result.input_receipts == -1 && result.debug_overlay == -1 && result.resolution_width == -1 && result.resolution_height == -1 && result.present_hz == -1);
+     expect_env("DM_OPMODE", NULL); expect_env("DM_HID_RECEIPT_LOG", NULL);
+     tests++;
+ }
+@@ -92,7 +92,7 @@ static void missing_defaults(void) {
+ static void valid_settings(void) {
+     reset_environment(); write_config("");
+     dm_android_launch_settings result = apply_ok(temporary);
+-    assert(result.present && result.operation_mode == -1 && result.input_receipts == -1 && result.debug_overlay == -1 && result.resolution_width == -1 && result.resolution_height == -1);
++    assert(result.present && result.operation_mode == -1 && result.input_receipts == -1 && result.debug_overlay == -1 && result.resolution_width == -1 && result.resolution_height == -1 && result.present_hz == -1);
+     expect_env("DM_OPMODE", "old-operation-mode"); expect_env("DM_HID_RECEIPT_LOG", "old-receipt-path");
+     tests++;
+ 
+@@ -131,7 +131,7 @@ static void valid_settings(void) {
+ 
+     reset_environment(); write_config("# comment\n\t \r\n");
+     result = apply_ok(temporary);
+-    assert(result.present && result.operation_mode == -1 && result.input_receipts == -1 && result.debug_overlay == -1 && result.resolution_width == -1 && result.resolution_height == -1);
++    assert(result.present && result.operation_mode == -1 && result.input_receipts == -1 && result.debug_overlay == -1 && result.resolution_width == -1 && result.resolution_height == -1 && result.present_hz == -1);
+     expect_env("DM_OPMODE", "old-operation-mode"); expect_env("DM_HID_RECEIPT_LOG", "old-receipt-path");
+     tests++;
+ 
+@@ -219,6 +219,32 @@ static void resolution_settings(void) {
+     tests++;
+ }
+ 
++static void present_hz_settings(void) {
++    // 0 = 跟随屏幕最高刷新率；其余是固定帧率。
++    // 0 = follow the screen's maximum refresh rate; anything else is a fixed rate.
++    reset_environment(); write_config("present_hz=0\n");
++    dm_android_launch_settings result = apply_ok(temporary);
++    assert(result.present_hz == 0);
++    tests++;
++    reset_environment(); write_config("present_hz=120\n");
++    result = apply_ok(temporary);
++    assert(result.present_hz == 120);
++    tests++;
++    // 省略这个键时是"未指定"（-1），前端保持原本的 60 Hz。
++    // Omitting the key leaves it unspecified (-1) and the front end keeps the original 60 Hz.
++    reset_environment(); write_config("operation_mode=console\n");
++    result = apply_ok(temporary);
++    assert(result.present_hz == -1);
++    tests++;
++    // 范围外与非法值都明确失败，不半应用。
++    // Out-of-range and malformed values fail loudly without applying anything.
++    expect_bad("present_hz=23\n", "present_hz must be 0 or 24-240");
++    expect_bad("present_hz=241\n", "present_hz must be 0 or 24-240");
++    expect_bad("present_hz=abc\n", "present_hz must be 0 or 24-240");
++    expect_bad("present_hz=60x\n", "present_hz must be 0 or 24-240");
++    expect_bad("present_hz=0\npresent_hz=60\n", "duplicate launch settings key on line 2");
++}
++
+ static void malformed_settings(void) {
+     expect_bad("operation_mode=handheld\nDM_VK_SHADERS=/tmp/fake\n", "unknown launch settings key on line 2");
+     expect_bad("input_receipts=1\noperation_mode=handheld\noperation_mode=console\n", "duplicate launch settings key on line 3");
+@@ -249,7 +275,7 @@ static void size_limits(void) {
+     memset(content, 'x', 256); content[0] = '#'; content[256] = 0;
+     reset_environment(); write_config(content);
+     dm_android_launch_settings result = apply_ok(temporary);
+-    assert(result.present && result.operation_mode == -1 && result.input_receipts == -1 && result.debug_overlay == -1 && result.resolution_width == -1 && result.resolution_height == -1);
++    assert(result.present && result.operation_mode == -1 && result.input_receipts == -1 && result.debug_overlay == -1 && result.resolution_width == -1 && result.resolution_height == -1 && result.present_hz == -1);
+     expect_env("DM_OPMODE", "old-operation-mode"); expect_env("DM_HID_RECEIPT_LOG", "old-receipt-path");
+     tests++;
+ 
+@@ -259,7 +285,7 @@ static void size_limits(void) {
+ 
+     memset(content, '\n', 4096); content[4096] = 0;
+     reset_environment(); write_config(content); result = apply_ok(temporary);
+-    assert(result.present && result.operation_mode == -1 && result.input_receipts == -1 && result.debug_overlay == -1 && result.resolution_width == -1 && result.resolution_height == -1);
++    assert(result.present && result.operation_mode == -1 && result.input_receipts == -1 && result.debug_overlay == -1 && result.resolution_width == -1 && result.resolution_height == -1 && result.present_hz == -1);
+     expect_env("DM_OPMODE", "old-operation-mode"); expect_env("DM_HID_RECEIPT_LOG", "old-receipt-path");
+     tests++;
+ 
+@@ -361,7 +387,7 @@ int main(int argc, char **argv) {
+     assert(mkdtemp(temporary));
+     n = snprintf(config_path, sizeof config_path, "%s/launch-settings.conf", temporary); assert(n > 0 && n < (int)sizeof config_path);
+     n = snprintf(receipt_path, sizeof receipt_path, "%s/input-receipts.jsonl", temporary); assert(n > 0 && n < (int)sizeof receipt_path);
+-    missing_defaults(); valid_settings(); overlay_settings(); resolution_settings(); malformed_settings(); size_limits(); invalid_paths();
++    missing_defaults(); valid_settings(); overlay_settings(); resolution_settings(); present_hz_settings(); malformed_settings(); size_limits(); invalid_paths();
+ #ifdef DM_LAUNCH_SETTINGS_TEST_WRAP_ENV
+     environment_failures();
+ #endif
+diff --git a/dm/gfx/nvn/hle_nvn.c b/dm/gfx/nvn/hle_nvn.c
+index a118017..b89c010 100644
+--- a/dm/gfx/nvn/hle_nvn.c
++++ b/dm/gfx/nvn/hle_nvn.c
+@@ -1169,9 +1169,43 @@ static void sleep_until_ns(uint64_t dl) {   // 单调时钟上的绝对时刻 |
+ // Present is fixed at 60 Hz: the adaptive mechanism stepped down at frame 60 in 24/24 real-device logs and never came back up, so for this phase 60 fps is the hard floor.
+ // DM_PRESENT_HZ=0 (uncapped frame rate) serves only as an explicit performance profiling switch: some of the game's UI logic counts frames (with the same save, uncapped gives
+ // 4181 SaveIndicatorPanel entries and capped at 60 fps gives 0, which matches the ground truth), so uncapped is a semantically wrong way to run and must not be used as a criterion / cross-check / default. Unit tests set it directly with nvn_present_config
+-static int g_hz = -1, g_display_mode;
++static int g_hz = -1, g_display_mode, g_hz_follow;
+ void nvn_present_config(int hz, int display_mode) { g_hz = hz; g_display_mode = display_mode; }
++// 前端可改的出图节拍（帧率目标）：hz > 0 固定帧率，hz < 0 跟随屏幕最高刷新率。
++// 运行中可改，下一次出图即生效（节拍变了，出图周期与窗口的刷新率请求一起跟着变）。
++// The present rate the front end can set: hz > 0 a fixed rate, hz < 0 follow the screen's maximum refresh rate.
++// It can change at run time and takes effect on the next present (the present period and the window's refresh-rate
++// request follow it).
++void nvn_present_hz_set(int hz) {
++    g_hz_follow = hz < 0;
++    g_hz = hz > 0 ? hz : -1;
++    // 每节拍一帧：帧率目标就是出图节拍本身（display 间隔模式）。
++    // One frame per tick: the frame rate target is the present rate itself (the display interval mode).
++    g_display_mode = 1;
++}
++// 当前生效的出图节拍（Hz）。
++// 固定值：解析一次就定住。**跟随屏幕：每次现算** —— 窗口（以及随之而来的屏幕刷新率）要等游戏起来
++// 才有（mtl_display_hz 在没有 surface 时报 0），开机那会儿解析一次就会把 60 锁死，之后再没人问屏幕。
++// The present rate in effect (Hz).
++// A fixed rate is resolved once. **Follow the screen is computed on every use**: the window (and with it the
++// screen's refresh rate) only exists once the game is up (mtl_display_hz reports 0 without a surface), so
++// resolving it at startup would lock 60 in for good and nobody would ask the screen again.
++int nvn_present_hz(void) {
++    if (g_hz_follow) {
++        const char *e = getenv("DM_PRESENT_HZ");
++        if (e) { int v = atoi(e); if (v > 0) return v; }   // 测试开关优先 | the test switch wins
++        int scr = mtl_display_hz();
++        if (scr > 0) return scr;                          // 窗口起来后就能问到了 | available once the window is up
++        return 60;
++    }
++    if (g_hz < 0) { const char *e = getenv("DM_PRESENT_HZ"); g_hz = e ? atoi(e) : 60; }
++    return g_hz;
++}
+ static void present_cfg(const win_t *o) {
++    // 跟随屏幕：节拍现算（见 nvn_present_hz），这里不定死，也不每次出图都打日志。
++    // Follow the screen: the rate is computed live (see nvn_present_hz); nothing is fixed here and nothing is
++    // logged on every present.
++    if (g_hz_follow) { g_display_mode = 1; return; }
+     if (g_hz >= 0) return;
+     // 有窗口仍缺省 display 间隔模式；无窗口缺省 game 模式。环境变量可覆盖固定 60 Hz。
+     // With a window the default is still display interval mode; without a window the default is game mode. Environment variables can override the fixed 60 Hz.
+@@ -1188,11 +1222,11 @@ static void present_cfg(const win_t *o) {
+     // (the save indicator is exempted as a timing race), and the timing differences of key messages are within game mode's own noise band; proof after entering a run is still missing, pending action script coverage
+     const char *m = getenv("DM_PRESENT_INTERVAL"); g_display_mode = m ? !strcmp(m, "display") : scr > 0;
+     LOG("[nvn] 出图节拍 %d Hz，间隔模式 %s（游戏设的出图间隔 %d；%s）", g_hz, g_display_mode ? "display（每节拍一帧，剪口）" : "game（原版语义）", o->interval,
+-        scr > 0 ? "有窗口，固定 60 Hz" : "无窗口，固定 60 Hz");
++        g_hz_follow ? (scr > 0 ? "跟随屏幕刷新率" : "无窗口，回落 60 Hz") : scr > 0 ? "有窗口，固定 60 Hz" : "无窗口，固定 60 Hz");
+ }
+ static uint64_t present_period(const win_t *o) {
+     present_cfg(o);
+-    int itv = g_display_mode ? 1 : o->interval > 0 ? o->interval : 1, hz = g_hz;
++    int itv = g_display_mode ? 1 : o->interval > 0 ? o->interval : 1, hz = nvn_present_hz();
+     return hz > 0 ? (uint64_t)itv * 1000000000ull / (uint64_t)hz : 0;
+ }
+ int (*g_nvn_loadscreen_up)(void);   // 宿主登记：读取画面此刻是否开着（diag.c 订阅界面消息时填；图形单测里为空 = 不设闸） | host registration: whether the loading screen is up right now (filled in when diag.c subscribes to UI messages; null in graphics unit tests = no gate)
+diff --git a/dm/host/crash.c b/dm/host/crash.c
+index 6ae3bd6..98bda6c 100644
+--- a/dm/host/crash.c
++++ b/dm/host/crash.c
+@@ -9,6 +9,8 @@
+ #include <sys/ucontext.h>
+ #include "dm_ucontext.h"
+ #include <unistd.h>
++#include <fcntl.h>
++#include <string.h>
+ #include <sys/mman.h>
+ #include <libkern/OSCacheControl.h>
+ #include <mach/mach.h>
+@@ -182,6 +184,33 @@ void crash_set_wait_dump(void (*fn)(void)) { g_wait_dump = fn; }
+ // 按需导出现场（不退出）：iOS 包没有无进展看门狗，冒烟判红时经 DM_LOG_PORT 发 dump 触发——各客体线程在等什么 + 图形侧等待点，和看门狗打的是同一份
+ // Dump the current state on demand (without exiting): the iOS app has no no-progress watchdog, so when the smoke test fails it sends dump through DM_LOG_PORT to trigger this -- what each guest thread is waiting on + the graphics-side wait points, the same thing the watchdog prints
+ void crash_dump_now(const char *why) { fprintf(stderr, "[dm] 现场导出（%s）：拍 %u / 阶段 %s\n", why, atomic_load(&g_watch_tick), g_watch_stage[atomic_load(&g_watch_stage_idx)]); if (g_dump_hook) g_dump_hook(); if (g_wait_dump) g_wait_dump(); }
++// 崩溃现场要**留得下来**。两件事各做一遍：
++// ① stderr 是块缓冲（不是 tty），进程被信号打死时缓冲里的内容一起丢 → 打印后 fflush；
++// ② 而且在安卓上 native 的 fd 2 并没有接到 logcat（内容直接进 /dev/null），所以现场还
++//    要另写一份到 app 私有目录的 crash.txt（DM_DATA），玩家/我们事后能直接取。
++// 做法：崩溃时把 fd 2 指向 crash.txt —— 下面所有打印（含模块内偏移换算那几行与寄存器）
++// 都落盘；再 fflush 一次把缓冲刷进去。
++// 真正权威的线索仍是 Zygote 那句 "exited due to signal N"（ActivityManager 的 "app died"
++// 与 libprocessgroup 的 killed process cgroup 都是后果，不是原因）。
++// The crash state must **survive**. Two things: ① stderr is block-buffered (not a tty), so the buffered content is
++// lost when the process is killed -- flush it; ② and on Android the native fd 2 is not wired to logcat (it goes
++// straight to /dev/null), so the state is also written to crash.txt in the app's private directory (DM_DATA):
++// point fd 2 at that file so everything printed below (module-relative offsets, the registers) lands on disk.
++// The authoritative clue is still Zygote's "exited due to signal N" (ActivityManager's "app died" and
++// libprocessgroup's "killed process cgroup" are consequences, not causes).
++static void crash_redirect(void) {
++    const char *dir = getenv("DM_DATA");
++    if (!dir || !*dir) return;
++    char path[1200];
++    int n = snprintf(path, sizeof path, "%s/crash.txt", dir);
++    if (n <= 0 || (size_t)n >= sizeof path) return;
++    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0600);
++    if (fd < 0) return;
++    const char *separator = "\n---- crash ----\n";
++    ssize_t ignored = write(fd, separator, strlen(separator)); (void)ignored;
++    ignored = dup2(fd, 2); (void)ignored;
++    close(fd);
++}
+ static void on_crash(int sig, siginfo_t *si, void *uc_) {
+     ucontext_t *uc = uc_;
+     if (sig == SIGTRAP && g_trap_hook && g_trap_hook(uc)) return;
+@@ -189,13 +218,16 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
+         int is_write = dm_uc_is_write(uc);   // ESR 的 WnR 位 | The WnR bit of ESR
+         for (int i = 0; i < g_nfault_hook; i++) if (g_fault_hook[i](si->si_addr, is_write, uc)) return;
+     }
++    crash_redirect();
+     fprintf(stderr, "[dm] CRASH sig=%d", sig);
+     off("addr", (uint64_t)si->si_addr); off("pc", DM_UC_PC(uc)); off("lr", DM_UC_LR(uc));
+     fprintf(stderr, " sp=%#llx\n", (unsigned long long)DM_UC_SP(uc));
+     for (int i = 0; i < 29; i++) fprintf(stderr, "x%d=%#llx%s", i, (unsigned long long)DM_UC_REG(uc, i), i % 6 == 5 ? "\n" : " ");
+     fprintf(stderr, "\n");
++    fflush(stderr);
+     dm_backtrace(DM_UC_FP(uc));
+     if (g_dump_hook) g_dump_hook();
++    fflush(stderr);
+     _exit(128 + sig);
+ }
+ // 信号备用栈是每线程的：每个客体线程起跑时都要调（栈溢出时才能在备用栈上打出现场）
+diff --git a/dm/host/dm.h b/dm/host/dm.h
+index fabd601..ed0a689 100644
+--- a/dm/host/dm.h
++++ b/dm/host/dm.h
+@@ -74,6 +74,7 @@ void dm_3d_scale_feed(double iv_ms);   // 出图线程每帧报实际上屏间
+ float dm_3d_scale_cur(void);          // 当前生效的 3D 渲染比例（hle_oe.c scale3d_tick）     // 当前累计出图帧数（DM_TICKS 对齐观测） | The 3D render scale currently in effect (hle_oe.c scale3d_tick)     // current cumulative count of presented frames (for DM_TICKS alignment observation)
+ void dm_3d_scale_resumed(void);       // 前端：刚回前台。回来头几秒的慢帧是恢复（表面重建、缓存变冷），不是 GPU 吃紧：停判 3 秒 | front end: just returned to the foreground. Slow frames in the first seconds back are recovery (surface rebuild, caches gone cold), not GPU pressure: stop judging for 3 seconds
+ void dm_3d_scale_set_preset(int preset);   // 游戏内菜单的「画质」档位：-1 自动（动态控制器照旧）、0 高质量（配置值满值）、1 平衡 0.85、2 性能 0.70；固定档位期间动态控制器不插手，下一拍生效 | In-game menu "quality" preset: -1 automatic (the dynamic controller keeps working), 0 high (the configured full value), 1 balanced 0.85, 2 performance 0.70; while a preset is pinned the dynamic controller stays out of the way, effective on the next tick
++void dm_present_hz_set(int hz);   // 前端可改的出图节拍（帧率目标）：>0 固定帧率，<0 跟随屏幕最高刷新率；运行中可改，下一次出图生效 | The present rate the front end can set: >0 a fixed rate, <0 follow the screen's maximum refresh rate; it can change at run time and takes effect on the next present
+ void dm_backtrace(uint64_t fp);
+ void crash_watch_progress(uint32_t tick, const char *stage);
+ void crash_watch_frame(void);
+diff --git a/dm/host/dm_i18n_tab.h b/dm/host/dm_i18n_tab.h
+index b00a858..18feb59 100644
+--- a/dm/host/dm_i18n_tab.h
++++ b/dm/host/dm_i18n_tab.h
+@@ -384,6 +384,9 @@ static const struct { const char *k, *zh, *en; } k_dm_i18n[] = {
+     { "dmAndroidMenuOverlay", "帧率显示", "Frame rate display" },
+     { "dmAndroidMenuControls", "虚拟摇杆", "On-screen controls" },
+     { "dmAndroidMenuQuality", "画质", "Quality" },
++    { "dmAndroidMenuFrameRate", "帧率", "Frame rate" },
++    { "dmAndroidMenuFpsUnit", "帧", "fps" },
++    { "dmAndroidMenuFpsFollow", "跟随屏幕", "Follow screen" },
+     { "dmAndroidMenuExit", "退出游戏", "Exit game" },
+     { "dmAndroidMenuOn", "开", "On" },
+     { "dmAndroidMenuOff", "关", "Off" },
+diff --git a/dm/host/dm_input.h b/dm/host/dm_input.h
+index dc9f3a0..8b5737d 100644
+--- a/dm/host/dm_input.h
++++ b/dm/host/dm_input.h
+@@ -63,6 +63,48 @@ static inline uint64_t dm_pad_trigger_buttons(float left, float right) {
+ // Private skill-aim-v1: takes only paired received samples of the right axis that GetNpad has actually returned, not values the front end has not yet had consumed.
+ void dm_input_sampled_right(int32_t *rx,int32_t *ry);
+ 
++// ---------- 手柄 / 触屏两套输入的接管权（iOS 前端 dm_gamepad.m 同语义，纯函数）----------
++// 谁有明确输入谁接管：
++//   · 手柄按下任何键、或把摇杆推出来 → 手柄模式（屏幕虚拟手柄隐藏，实体手柄接管）；
++//   · 碰了屏幕 → 触屏模式（虚拟手柄显示，实体手柄的摇杆不交给游戏）；
++//   · 碰过屏幕之后，摇杆要先回中、再推出来才重新接管（一直偏着的摇杆不会把接管权抢回来）；按键随时接管。
++// 摇杆带迟滞：推过 25% 才算推出，回到 15% 以内才算回中 —— 停在阈值附近的漂移不会一会儿算一会儿不算。
++// 这套规则放在纯函数里，安卓前端（frontend_activity.c）与宿主单测（t_padmode）用同一份，不各写一套。
++// Controller / touch takeover (same rules as the iOS front end, pure functions): whoever has explicit input takes over.
++//   - Controller: any button press or a stick pushed out -> controller mode (the on-screen controls hide);
++//   - the screen is touched -> touch mode (the on-screen controls show, the controller sticks are not handed to the game);
++//   - after the screen was touched, a stick has to return to centre and be pushed out again before it takes over; buttons always take over.
++// The sticks have hysteresis: past 25% counts as pushed out, back within 15% counts as centred, so drift near the threshold
++// does not count one moment and not the next. The rules live in pure functions so the Android front end and the host test share them.
++typedef struct {
++    int stick_on[2];   // 两根摇杆是否推出来了（带迟滞） | whether each stick is pushed out (with hysteresis)
++    int need_center;   // 碰过屏幕后，摇杆要回中再推出来才重新接管 | after a screen touch, a stick must recentre before it takes over again
++} dm_pad_mode_state;
++
++// 摇杆迟滞：没推出时要过 25% 才算推出，已经推出时回到 15% 以内才算回中。
++// Stick hysteresis: not pushed out yet, it has to pass 25% to count as pushed out; once pushed out, back within 15% counts as centred.
++static inline int dm_pad_mode_stick(int was_on, int32_t x, int32_t y) {
++    double limit = (was_on ? 0.15 : 0.25) * (double)DM_STICK_MAX;
++    return (double)x * x + (double)y * y >= limit * limit;
++}
++// 更新一根摇杆的推出状态。
++// Update one stick's pushed-out state.
++static inline void dm_pad_mode_update(dm_pad_mode_state *state, int index, int32_t x, int32_t y) {
++    state->stick_on[index] = dm_pad_mode_stick(state->stick_on[index], x, y);
++}
++// 两根摇杆都回中了 → 解除"要先回中"的限制（之后再推出来就能接管）。
++// Both sticks centred -> the "must recentre first" restriction is lifted (pushing out again takes over from then on).
++static inline void dm_pad_mode_centered(dm_pad_mode_state *state) {
++    if (!state->stick_on[0] && !state->stick_on[1]) state->need_center = 0;
++}
++// 接管权判定：按下了新的键，或摇杆推出来了（且不在"要先回中"的限制里）。
++// Takeover decision: a new button press, or a stick pushed out (and not under the "must recentre first" restriction).
++static inline int dm_pad_mode_takeover(const dm_pad_mode_state *state, uint64_t buttons, uint64_t previous_buttons) {
++    if (buttons & ~previous_buttons) return 1;
++    if ((state->stick_on[0] || state->stick_on[1]) && !state->need_center) return 1;
++    return 0;
++}
++
+ // 手柄状态注入点：GetNpadState 填完原状态后、伪键覆盖前调用。Mac 宿主触点脚本（touch_mac.c，Mac 专用、按 _mac 约定不进 iOS 包）启动时注册；iOS 不带该文件，保持空
+ // Controller state injection point: called after GetNpadState has filled in the original state and before the pseudo-key override. The Mac host touch point script (touch_mac.c, Mac only, kept out of the iOS app by the _mac convention) registers at startup; iOS does not carry that file and it stays empty
+ extern void (*dm_pad_hook)(uint64_t now, uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_t *ry);
+diff --git a/dm/host/hle_oe.c b/dm/host/hle_oe.c
+index fd84532..eca56b2 100644
+--- a/dm/host/hle_oe.c
++++ b/dm/host/hle_oe.c
+@@ -210,6 +210,17 @@ void dm_3d_scale_set_preset(int preset) {
+     atomic_store(&g_scale3d_forced, preset);
+     LOG("3D 比例档位切到「%s」，下一拍生效", preset < 0 ? "自动" : preset == 0 ? "高质量" : preset == 1 ? "平衡" : "性能");
+ }
++// 前端可改的出图节拍（帧率目标）：>0 固定帧率，<0 跟随屏幕最高刷新率。
++// 运行中可改，下一次出图生效：出图周期、窗口的刷新率请求、3D 比例控制的目标周期一起跟着变。
++// The present rate the front end can set: >0 a fixed rate, <0 follow the screen's maximum refresh rate.
++// It takes effect on the next present: the present period, the window's refresh-rate request and the dynamic 3D
++// controller's target period follow it.
++void dm_present_hz_set(int hz) {
++    void nvn_present_hz_set(int); int nvn_present_hz(void);
++    nvn_present_hz_set(hz);
++    if (hz < 0) LOG("出图节拍目标 → 跟随屏幕刷新率（窗口起来后按屏幕的实际刷新率走）");
++    else LOG("出图节拍目标 → %d Hz", hz);
++}
+ static _Atomic int g_scale3d_level;
+ static _Atomic int g_scale3d_resumed;
+ void dm_3d_scale_resumed(void) { atomic_store(&g_scale3d_resumed, 1); }   // 前端：刚回前台。回来头几秒的慢帧是恢复（表面重建、缓存变冷），不是 GPU 吃紧：停判 3 秒 | front end: just returned to foreground. Slow frames in the first few seconds back are recovery (surface rebuild, caches gone cold), not GPU pressure: suspend judging for 3 seconds
+@@ -225,7 +236,15 @@ void dm_3d_scale_feed(double iv_ms) {   // 出图线程每帧调（diag.c dm_per
+     { static int was; int in = dm_ingame_now();   // 不在局内（菜单 / 读取）不判；刚进局的 20 秒也不判（进局头十几秒的慢帧是装载，不是 GPU 吃紧） | not judged outside a run (menu / loading); not judged in the first 20 seconds of a run either (slow frames in the first ten-odd seconds of a run are loading, not GPU pressure)
+       if (!in) { was = 0; scale3d_ctl_hold(&c, now, S3_SEC); return; }
+       if (!was) { was = 1; if (inj0 < 0) scale3d_ctl_hold(&c, now, 20 * S3_SEC); } }
+-    { int mtl_fps_target(void); double p = mtl_fps_target() == 30 ? 1000.0 / 30 : 0; if (p != c.period_ms) { c.period_ms = p; scale3d_ctl_hold(&c, now, 2 * S3_SEC); } }   // 省电模式（30 帧）：目标周期跟着换，切换后停判 2 秒 | power-saving mode (30 fps): the target period changes with it, judging is suspended for 2 seconds after the switch
++    { int mtl_fps_target(void); int nvn_present_hz(void);
++      // 目标周期：省电模式（30 帧）走显示节拍那条；前端指定的出图节拍（安卓端的帧率档）按它算。
++      // 两者都不动时是 0 —— 控制器按 60 帧的缺省目标判。
++      // The target period: power-saving mode (30 frames) comes from the display link; a present rate the front end set
++      // (the Android frame rate preset) is used as given. With neither, it stays 0 and the controller judges against
++      // the 60 fps default.
++      double p = mtl_fps_target() == 30 ? 1000.0 / 30 : 0;
++      int hz = nvn_present_hz(); if (hz > 0 && hz != 60) p = 1000.0 / hz;
++      if (p != c.period_ms) { c.period_ms = p; scale3d_ctl_hold(&c, now, 2 * S3_SEC); } }   // 帧率档换了：目标周期跟着换，切换后停判 2 秒 | the frame rate preset changed: the target period follows, judging is suspended for 2 seconds after the switch
+     int was = c.level, lv = scale3d_ctl_step(&c, iv_ms, now);
+     if (lv != was) LOG("3D 比例控制：窗口帧率 %.1f（目标 %.0f）→ %s到第 %d 级%s", c.last_fps, c.period_ms > 0 ? 1000.0 / c.period_ms : 60.0, lv > was ? "降" : "升", lv, c.need_good ? "（刚升又掉：下次升档要 60 秒）" : "");
+     atomic_store(&g_scale3d_level, lv);
+diff --git a/dm/host/tests/Makefile b/dm/host/tests/Makefile
+index 974b50a..54b88b4 100644
+--- a/dm/host/tests/Makefile
++++ b/dm/host/tests/Makefile
+@@ -4,7 +4,7 @@ DM_ROOT ?= $(HOME)/dm-work
+ PY ?= $(DM_ROOT)/build/cache/dm/venv/bin/python
+ EXEFS ?= $(DM_ROOT)/data/switch/3.3.94012/Update/ExeFS
+ B = build
+-run: $(B)/t_thread_leak $(B)/t_rift_clock $(B)/t_textbox $(B)/t_padmap $(B)/t_touch $(B)/t_hid_receipt $(B)/t_hid_script $(B)/t_touch_mac $(B)/t_oe $(B)/t_fs $(B)/t_fs_case $(B)/t_romfs_validate $(B)/t_audio $(B)/t_audio_spsc $(B)/t_swkbd $(B)/t_altstack $(B)/t_movie $(B)/t_condvar $(B)/t_condvar_old $(B)/t_target_rank $(B)/t_hud_dead $(B)/t_namegen $(B)/t_modetx $(B)/t_unit_level $(B)/t_widget $(B)/t_doorspot $(B)/t_cloudsync $(B)/t_i18n $(B)/main.orig.bin $(B)/subsdk0.orig.bin
++run: $(B)/t_thread_leak $(B)/t_rift_clock $(B)/t_textbox $(B)/t_padmap $(B)/t_padmode $(B)/t_touch $(B)/t_hid_receipt $(B)/t_hid_script $(B)/t_touch_mac $(B)/t_oe $(B)/t_fs $(B)/t_fs_case $(B)/t_romfs_validate $(B)/t_audio $(B)/t_audio_spsc $(B)/t_swkbd $(B)/t_altstack $(B)/t_movie $(B)/t_condvar $(B)/t_condvar_old $(B)/t_target_rank $(B)/t_hud_dead $(B)/t_namegen $(B)/t_modetx $(B)/t_unit_level $(B)/t_widget $(B)/t_doorspot $(B)/t_cloudsync $(B)/t_i18n $(B)/main.orig.bin $(B)/subsdk0.orig.bin
+ 	python3 native_write_scan.py --selftest ..
+ 	python3 mode_scan.py ../..
+ 	python3 ../../ios/tools/dm_i18n.py --check
+@@ -32,6 +32,7 @@ run: $(B)/t_thread_leak $(B)/t_rift_clock $(B)/t_textbox $(B)/t_padmap $(B)/t_to
+ 	$(B)/t_namegen
+ 	$(B)/t_modetx
+ 	$(B)/t_padmap
++	$(B)/t_padmode
+ 	$(B)/t_unit_level
+ 	$(B)/t_widget
+ 	$(B)/t_doorspot
+@@ -53,6 +54,8 @@ $(B)/t_unit_level: t_unit_level.c ../dm_unit.h | $(B)
+ 	clang -O1 -Wall -Werror -I.. -o $@ t_unit_level.c
+ $(B)/t_padmap: t_padmap.c ../dm_padmap.h ../dm_input.h | $(B)
+ 	clang -O1 -Wall -Werror -o $@ t_padmap.c
++$(B)/t_padmode: t_padmode.c ../dm_input.h | $(B)
++	clang -O1 -Wall -Werror -o $@ t_padmode.c
+ $(B)/t_modetx: t_modetx.c ../dm_modetx.h | $(B)
+ 	clang -O1 -Wall -Werror -o $@ t_modetx.c
+ $(B)/t_namegen: t_namegen.c ../dm_namegen.c | $(B)
+diff --git a/dm/host/tests/t_padmode.c b/dm/host/tests/t_padmode.c
+new file mode 100644
+index 0000000..1b417a0
+--- /dev/null
++++ b/dm/host/tests/t_padmode.c
+@@ -0,0 +1,72 @@
++// 手柄 / 触屏两套输入的接管权（dm_input.h 的纯函数）：迟滞、按下沿、碰过屏幕后要先回中。
++// 规则与 iOS 前端 dm_gamepad.m 同源，这里逐条钉住，免得两端各写一份后走样。
++// The controller / touch takeover rules (the pure functions in dm_input.h): hysteresis, button press edges and the
++// "must recentre first" rule after a screen touch. Same source as the iOS front end; pinned here so the two copies
++// cannot drift apart.
++#include <stdio.h>
++#include <stdint.h>
++#include "../dm_input.h"
++
++static int checks, fails;
++#define CHECK(c, ...) do { checks++; if (c) printf("  ✓ "); else { fails++; printf("  ✗ "); } printf(__VA_ARGS__); printf("\n"); } while (0)
++
++int main(void) {
++    // 摇杆迟滞：没推出时要过 25% 才算推出，推出来之后回到 15% 以内才算回中。
++    // Stick hysteresis: not pushed out yet, it has to pass 25% to count as pushed out; once pushed out, back within
++    // 15% counts as centred. (DM_STICK_MAX = 32767, so 25% = 8192 and 15% = 4915.)
++    CHECK(dm_pad_mode_stick(0, 0, 0) == 0, "摇杆居中 = 没推出");
++    CHECK(dm_pad_mode_stick(0, 4000, 0) == 0, "推 12%% 不算推出（没过 25%%）");
++    CHECK(dm_pad_mode_stick(0, 9000, 0) == 1, "推 27%% 算推出");
++    CHECK(dm_pad_mode_stick(0, 6000, 6000) == 1, "斜推 26%%（合起来）算推出");
++    CHECK(dm_pad_mode_stick(1, 9000, 0) == 1, "已经推出，27%% 仍算推出");
++    CHECK(dm_pad_mode_stick(1, 6000, 0) == 1, "已经推出，18%% 仍算推出（迟滞：回中要到 15%% 以内）");
++    CHECK(dm_pad_mode_stick(1, 4000, 0) == 0, "已经推出，回到 12%% 才算回中");
++
++    // 接管权：按下的那一刻（新的按下沿）→ 手柄接管；一直按着不放手 → 不重复接管。
++    // Takeover: the moment a button goes down (a new press edge) -> controller mode; holding it does not re-trigger.
++    dm_pad_mode_state state = { {0, 0}, 0 };
++    CHECK(dm_pad_mode_takeover(&state, DM_BTN_A, 0) == 1, "按下 A → 手柄接管");
++    CHECK(dm_pad_mode_takeover(&state, DM_BTN_A, DM_BTN_A) == 0, "按住 A 不放 → 没有新的按下沿，不接管");
++    CHECK(dm_pad_mode_takeover(&state, DM_BTN_A | DM_BTN_B, DM_BTN_A) == 1, "再按下 B → 接管");
++
++    // 摇杆推出来也算明确输入。
++    // A stick pushed out is explicit input as well.
++    dm_pad_mode_state pushed = { {0, 0}, 0 };
++    dm_pad_mode_update(&pushed, 0, 9000, 0);
++    CHECK(pushed.stick_on[0] == 1, "左摇杆记为推出");
++    CHECK(dm_pad_mode_takeover(&pushed, 0, 0) == 1, "摇杆推出来 → 手柄接管");
++
++    // 碰过屏幕之后：一直偏着的摇杆不夺回接管权（漂移大的手柄不能把界面来回切）。
++    // After the screen was touched, a stick that stays deflected does not take the takeover back (a controller with
++    // heavy drift must not flip the UI back and forth).
++    dm_pad_mode_state recentred = { {0, 0}, 1 };
++    CHECK(dm_pad_mode_takeover(&recentred, 0, 0) == 0, "碰过屏幕后，摇杆没动 → 不接管");
++    dm_pad_mode_update(&recentred, 0, 9000, 0);
++    CHECK(dm_pad_mode_takeover(&recentred, 0, 0) == 0, "碰过屏幕后，摇杆仍偏着 → 不接管");
++    // 回中 → 解除限制 → 再推出来 → 接管。
++    // Back to centre -> the restriction is lifted -> pushed out again -> it takes over.
++    dm_pad_mode_update(&recentred, 0, 1000, 0);
++    dm_pad_mode_centered(&recentred);
++    CHECK(recentred.need_center == 0, "两根摇杆都回中 → 解除『要先回中』");
++    dm_pad_mode_update(&recentred, 0, 9000, 0);
++    CHECK(dm_pad_mode_takeover(&recentred, 0, 0) == 1, "回中后再推出来 → 接管");
++    // 按键随时接管：「要先回中」只管摇杆。
++    // Buttons always take over: the "must recentre first" rule only applies to the sticks.
++    CHECK(dm_pad_mode_takeover(&recentred, DM_BTN_A, 0) == 1, "碰过屏幕后按键照样接管");
++
++    // 摇杆还偏着时，「要先回中」不解除。
++    // While a stick is still deflected the restriction stays.
++    dm_pad_mode_state held = { {0, 0}, 1 };
++    dm_pad_mode_update(&held, 0, 9000, 0);
++    dm_pad_mode_centered(&held);
++    CHECK(held.need_center == 1, "摇杆还偏着 → 『要先回中』不解除");
++    // 右摇杆单独推出也算（它是技能方向用的那根）。
++    // The right stick counts on its own as well (it is the one used for skill direction).
++    dm_pad_mode_state right = { {0, 0}, 0 };
++    dm_pad_mode_update(&right, 1, 0, 9000);
++    CHECK(right.stick_on[0] == 0 && right.stick_on[1] == 1, "只更新右摇杆那一路");
++    CHECK(dm_pad_mode_takeover(&right, 0, 0) == 1, "右摇杆推出来 → 手柄接管");
++
++    printf("== %d 项，失败 %d ==\n", checks, fails);
++    return fails != 0;
++}
+diff --git a/dm/i18n/ui_text.tsv b/dm/i18n/ui_text.tsv
+index b4989e9..68b8c27 100644
+--- a/dm/i18n/ui_text.tsv
++++ b/dm/i18n/ui_text.tsv
+@@ -382,6 +382,9 @@ dmAndroidMenuTitle	游戏菜单	Game menu	Android 游戏内菜单
+ dmAndroidMenuOverlay	帧率显示	Frame rate display	Android 游戏内菜单
+ dmAndroidMenuControls	虚拟摇杆	On-screen controls	Android 游戏内菜单
+ dmAndroidMenuQuality	画质	Quality	Android 游戏内菜单
++dmAndroidMenuFrameRate	帧率	Frame rate	Android 游戏内菜单
++dmAndroidMenuFpsUnit	帧	fps	Android 游戏内菜单
++dmAndroidMenuFpsFollow	跟随屏幕	Follow screen	Android 游戏内菜单
+ dmAndroidMenuExit	退出游戏	Exit game	Android 游戏内菜单
+ dmAndroidMenuOn	开	On	Android 游戏内菜单
+ dmAndroidMenuOff	关	Off	Android 游戏内菜单

@@ -1,0 +1,31 @@
+# never commit key material
+*.keys
+*.keys-*
+prod.keys
+title.keys
+switch key/
+
+# 高通的专有驱动二进制没有再分发授权，不随仓库分发（见 drivers/Qualcomm_840/README.md）。
+# 本机自用时把文件放进那个目录即可，git 会忽略它们。
+drivers/Qualcomm_840/*.so
+
+# 注入专有驱动后的成品 APK 同理不随仓库分发（基线 APK apk/D2R-Android-port.apk 仍然保留）。
+apk/D2R-Android-port-adreno650-*.apk
+
+# build leftovers
+apk-patch/
+*.idsig
+*.pyc
+__pycache__/
+
+# large local artifacts that are not part of the deliverable
+d2r-package*.zip
+shaders*.zip
+
+# the build toolchain / working area lives next to the repo, not inside it.
+# These are anchored to the repository root on purpose: an unanchored "tools/"
+# would also drop upstream/dm/*/tools/, which holds the Android build scripts.
+/build-tools-win/
+/pack-workspace/
+/tools/
+/build-win.py

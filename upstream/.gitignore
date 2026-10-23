@@ -1,0 +1,30 @@
+# 构建产物（Xcode 的派生数据目录，由 dm/ios 下的脚本生成）
+.iosdd/
+.iosdd_mac/
+.iosdd_*/
+.DS_Store
+
+# Local game inputs, secrets and generated distributions (source publication only)
+*.apk
+*.aab
+*.xci
+*.nsp
+*.nsz
+*.nca
+*.keys
+*.keystore
+*.jks
+.env
+.env.*
+local.env
+/romfs/
+/RomFS/
+/ExeFS/
+/save/
+/pipeline-cache/
+
+# CI：下载的 Android 工具链与打出的套件目录（都只在本机/runner 上）
+.tools/
+/dist/
+
+.work/
